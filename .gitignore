@@ -1,0 +1,21 @@
+# Environments
+venv/
+env/
+.env
+.venv
+__pycache__/
+*.pyc
+
+# IDEs y Editores
+.vscode/
+.idea/
+.DS_Store
+
+# Archivos de la Aplicación de Traducción
+output/
+temp/
+*.pdf
+
+# Si decides guardar tu modelo usando rutas o pesos locales
+*.gguf
+*.bin

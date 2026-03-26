@@ -19,6 +19,8 @@ import argparse
 import subprocess
 import textwrap
 import time
+import threading
+import concurrent.futures
 from pathlib import Path
 
 try:
@@ -41,6 +43,7 @@ DEFAULTS = {
     "chunk_tokens": 900,                 # aprox tokens por chunk de traducción
     "timeout":      120,                 # segundos por petición al LLM
     "retries":      3,                   # reintentos ante fallo de red
+    "workers":      8,                   # solicitudes paralelas al LLM
     "paginas":      None,
     "output":       "output",
     "no_pdf":       False,
@@ -208,6 +211,7 @@ def extraer_markdown_por_pagina(pdf_path: str, paginas: list[int], images_dir: P
         write_images=True,
         image_path=str(images_dir_abs),
         image_format="png",
+        use_ocr=False,   # el PDF ya tiene texto seleccionable, no necesita Tesseract
     )
 
     resultado = []
@@ -218,10 +222,13 @@ def extraer_markdown_por_pagina(pdf_path: str, paginas: list[int], images_dir: P
         num_pag = chunk.get("metadata", {}).get("page") or paginas[i] + 1
 
         texto = texto.strip()
-        # Ignorar páginas que sólo tienen marcadores de imagen y espacios
+        # Ignorar páginas que no tienen contenido alfanumérico real
+        # (portadas que son imagen pura, páginas en blanco, etc.)
         texto_util = texto.replace("==> picture", "").replace("intentionally omitted", "").strip()
-        if not texto_util or all(c in "<>=*#- \n" for c in texto_util):
-            log(f"  Página {num_pag}: sólo imagen, omitida.")
+        # Contar caracteres alfanuméricos reales (letras y números)
+        chars_reales = sum(1 for c in texto_util if c.isalnum())
+        if chars_reales < 20:
+            log(f"  Página {num_pag}: texto insuficiente ({chars_reales} chars útiles), omitida.")
             continue
 
         resultado.append({"page": num_pag, "markdown": texto})
@@ -240,34 +247,45 @@ import re
 def agrupar_en_chunks(paginas_md: list[dict], max_tokens: int) -> list[dict]:
     """
     Agrupa el texto en lotes semánticos (por párrafo) respetando max_tokens.
-    Reconstruye inteligentemente oraciones rotas por saltos de página.
+    Reconstruye oraciones rotas por saltos de página, pero NUNCA fusiona
+    si el bloque anterior es un encabezado Markdown o una línea corta de portada.
     Cada chunk incluye metadatos de las páginas que abarca.
     """
     bloques = []
-    
+
     # 1. Descomponer todo en párrafos individuales, uniendo frases partidas entre páginas
     for pmd in paginas_md:
         texto = pmd["markdown"].strip()
         if not texto:
             continue
-            
+
         parrafos = [p.strip() for p in texto.split("\n\n") if p.strip()]
         if not parrafos:
             continue
-            
-        # Si hay un bloque anterior y termina sin puntuación final, asumimos que un salto de página cortó la frase
-        if bloques and bloques[-1]["texto"] and bloques[-1]["texto"][-1] not in ".!?\":;)]>":
-            # Prevenir la fusión si el siguiente párrafo es un elemento de bloque de Markdown (título, lista, imagen)
-            is_block = re.match(r"^(#{1,6}\s|\* |\- |\d+\. |!\[|> )", parrafos[0])
-            if not is_block:
-                bloques[-1]["texto"] += " " + parrafos[0]
-                bloques[-1]["paginas"].add(pmd["page"])
-                parrafos = parrafos[1:] # Procesar el resto normalmente
-            
+
+        # Fusionar frase cortada por salto de página SÓLO si:
+        #   a) el bloque anterior no termina con puntuación final
+        #   b) el bloque anterior NO es un encabezado Markdown (# título)
+        #   c) el siguiente párrafo NO es un elemento de bloque (título, lista, imagen)
+        if bloques and bloques[-1]["texto"]:
+            ultimo = bloques[-1]["texto"]
+            ultimo_sin_formato = ultimo.lstrip("#* \t")
+            es_encabezado_previo = re.match(r"^#{1,6}\s", ultimo)
+            es_linea_corta = len(ultimo_sin_formato.strip()) < 60  # título corto de portada
+            termina_sin_puntuacion = ultimo[-1] not in ".!?\":;)]>"
+
+            if termina_sin_puntuacion and not es_encabezado_previo and not es_linea_corta:
+                is_block = re.match(r"^(#{1,6}\s|\* |\- |\d+\. |!\[|> )", parrafos[0])
+                if not is_block:
+                    bloques[-1]["texto"] += " " + parrafos[0]
+                    bloques[-1]["paginas"].add(pmd["page"])
+                    parrafos = parrafos[1:]  # Procesar el resto normalmente
+
         for p in parrafos:
             bloques.append({"texto": p, "paginas": {pmd["page"]}})
 
-    # 2. Empaquetar los párrafos en chunks de traducción según max_tokens
+    # 2. Empaquetar los párrafos en chunks de traducción según max_tokens.
+    # Los encabezados Markdown (#) siempre fuerzan un corte para no mezclar secciones.
     chunks = []
     buffer_texto = ""
     buffer_paginas = set()
@@ -275,8 +293,10 @@ def agrupar_en_chunks(paginas_md: list[dict], max_tokens: int) -> list[dict]:
     for b in bloques:
         tokens_nuevos = estimar_tokens(b["texto"])
         tokens_actuales = estimar_tokens(buffer_texto)
-        
-        if tokens_actuales + tokens_nuevos > max_tokens and buffer_texto:
+        es_encabezado = re.match(r"^#{1,6}\s", b["texto"])
+
+        # Cortar si: supera el límite de tokens, o el bloque es un encabezado y ya hay buffer
+        if buffer_texto and (tokens_actuales + tokens_nuevos > max_tokens or es_encabezado):
             chunks.append({"paginas": sorted(list(buffer_paginas)), "texto": buffer_texto.strip()})
             buffer_texto = b["texto"]
             buffer_paginas = set(b["paginas"])
@@ -615,6 +635,7 @@ def main():
     parser.add_argument("--chunk-tokens",   default=DEFAULTS["chunk_tokens"], type=int)
     parser.add_argument("--timeout",        default=DEFAULTS["timeout"],      type=int)
     parser.add_argument("--retries",        default=DEFAULTS["retries"],      type=int)
+    parser.add_argument("--workers",        default=DEFAULTS["workers"],      type=int, help="Solicitudes paralelas al LLM (default: 8)")
     parser.add_argument("--paginas",        default=DEFAULTS["paginas"],      help="Rango de páginas ej: 1-50,80-100")
     parser.add_argument("--output",         default=DEFAULTS["output"],       help="Carpeta de salida")
     parser.add_argument("--no-pdf",         action="store_true", default=DEFAULTS["no_pdf"], help="Sólo generar .md, no PDF")
@@ -635,6 +656,7 @@ def main():
         "api_base": args.api_base,
         "timeout":  args.timeout,
         "retries":  args.retries,
+        "workers":  args.workers,
     }
 
     # Directorios de salida
@@ -657,6 +679,7 @@ def main():
     print("=" * 60)
     print(f"  PDF Translator — {args.src} → {args.dst}")
     print(f"  Backend : {args.backend} | Modelo: {args.model}")
+    print(f"  Workers : {args.workers} solicitudes paralelas")
     print(f"  Entrada : {pdf_path.name}")
     print(f"  Salida  : {out_dir}/")
     print("=" * 60)
@@ -697,27 +720,39 @@ def main():
 
     # ── Cargar caché ───────────────────────────────────────
     cache = {"chunks_done": [], "translated_parts": []} if args.limpio else cargar_cache(cache_path)
+    cache_lock = threading.Lock()  # Protege las escrituras concurrentes a caché
 
-    # ── Traducción chunk a chunk ───────────────────────────
+    workers = args.workers
+    modo_paralelo = workers > 1
+
+    # ── Traducción ─────────────────────────────────────────
     print()
-    log(f"Iniciando traducción: {len(chunks)} chunks...")
+    if modo_paralelo:
+        log(f"Iniciando traducción PARALELA: {len(chunks)} chunks, {workers} workers...")
+        log("[!] Modo paralelo: contexto entre chunks desactivado.", "WARN")
+    else:
+        log(f"Iniciando traducción secuencial: {len(chunks)} chunks...")
 
-    # Reconstruir contexto_previo a partir de los chunks ya en caché (en orden)
-    # Esto garantiza que el primer chunk nuevo reciba contexto correcto al reanudar.
-    contexto_previo = ""
-    for _cid in cache["chunks_done"]:
-        _idx = cache["chunks_done"].index(_cid)
-        _part = cache["translated_parts"][_idx] if _idx < len(cache["translated_parts"]) else ""
-        if _part:
-            contexto_previo = _part[-300:]
+    # En modo secuencial, reconstruir contexto del caché para continuar correctamente
+    contexto_previo_seq = ""
+    if not modo_paralelo:
+        for _cid in cache["chunks_done"]:
+            _idx = cache["chunks_done"].index(_cid)
+            _part = cache["translated_parts"][_idx] if _idx < len(cache["translated_parts"]) else ""
+            if _part:
+                contexto_previo_seq = _part[-300:]
 
-    for i, chunk in enumerate(chunks):
+    def _traducir_uno(i: int, chunk: dict) -> tuple[int, str]:
+        """Traduce un chunk y devuelve (índice, texto_traducido). Thread-safe."""
         chunk_id = f"chunk_{i:04d}"
         paginas_str = ",".join(str(p) for p in chunk["paginas"])
 
+        # Verificar caché (lectura sin lock: chunks_done no muta durante el parallel map)
         if chunk_id in cache["chunks_done"]:
+            idx = cache["chunks_done"].index(chunk_id)
+            cached = cache["translated_parts"][idx] if idx < len(cache["translated_parts"]) else chunk["texto"]
             log(f"  [{i+1}/{len(chunks)}] páginas {paginas_str} — ya traducido (skip)")
-            continue
+            return (i, cached)
 
         log(f"  [{i+1}/{len(chunks)}] Traduciendo páginas {paginas_str} "
             f"(~{estimar_tokens(chunk['texto'])} tokens)...")
@@ -726,41 +761,83 @@ def main():
             chunk["texto"],
             args.src,
             args.dst,
-            contexto_previo,
+            "",   # sin contexto en paralelo (orden no garantizado)
             cfg,
         )
 
         if not traduccion:
-            # Si el LLM falló completamente, usar el texto original y registrar el error
-            log(f"  [{i+1}/{len(chunks)}] ADVERTENCIA: traducción fallida, se conserva texto original.", "ERR")
+            log(f"  [{i+1}/{len(chunks)}] ADVERTENCIA: traducción fallida, conservando original.", "ERR")
             traduccion = chunk["texto"]
 
-        # Actualizar contexto con el final del chunk traducido (últimos 300 chars)
-        contexto_previo = traduccion[-300:]
+        # Guardar en caché de forma thread-safe
+        with cache_lock:
+            cache["chunks_done"].append(chunk_id)
+            cache["translated_parts"].append(traduccion)
+            guardar_cache(cache_path, cache)
 
-        # Guardar en caché
-        cache["chunks_done"].append(chunk_id)
-        cache["translated_parts"].append(traduccion)
-        guardar_cache(cache_path, cache)
+        return (i, traduccion)
+
+    if modo_paralelo:
+        # Traducción paralela con ThreadPoolExecutor
+        resultados: dict[int, str] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_traducir_uno, i, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx, texto = future.result()
+                    resultados[idx] = texto
+                except Exception as exc:
+                    orig_i = futures[future]
+                    log(f"  Chunk {orig_i} lanzó excepción: {exc}", "ERR")
+                    resultados[orig_i] = chunks[orig_i]["texto"]
+    else:
+        # Traducción secuencial (con contexto entre chunks)
+        resultados: dict[int, str] = {}
+        for i, chunk in enumerate(chunks):
+            chunk_id = f"chunk_{i:04d}"
+            paginas_str = ",".join(str(p) for p in chunk["paginas"])
+
+            if chunk_id in cache["chunks_done"]:
+                log(f"  [{i+1}/{len(chunks)}] páginas {paginas_str} — ya traducido (skip)")
+                idx = cache["chunks_done"].index(chunk_id)
+                resultados[i] = cache["translated_parts"][idx] if idx < len(cache["translated_parts"]) else chunk["texto"]
+                contexto_previo_seq = resultados[i][-300:]
+                continue
+
+            log(f"  [{i+1}/{len(chunks)}] Traduciendo páginas {paginas_str} "
+                f"(~{estimar_tokens(chunk['texto'])} tokens)...")
+
+            traduccion = traducir_chunk(
+                chunk["texto"],
+                args.src,
+                args.dst,
+                contexto_previo_seq,
+                cfg,
+            )
+
+            if not traduccion:
+                log(f"  [{i+1}/{len(chunks)}] ADVERTENCIA: traducción fallida, conservando original.", "ERR")
+                traduccion = chunk["texto"]
+
+            contexto_previo_seq = traduccion[-300:]
+            resultados[i] = traduccion
+
+            with cache_lock:
+                cache["chunks_done"].append(chunk_id)
+                cache["translated_parts"].append(traduccion)
+                guardar_cache(cache_path, cache)
 
     # ── Ensamblar Markdown final ───────────────────────────
     log("Ensamblando Markdown traducido...")
 
-    # Construir el Markdown en el orden correcto de los chunks (no del caché)
-    # Esto evita problemas cuando la caché tiene partes en desorden o incompleta.
-    partes_ordenadas = []
-    for i in range(len(chunks)):
-        chunk_id = f"chunk_{i:04d}"
-        if chunk_id in cache["chunks_done"]:
-            idx = cache["chunks_done"].index(chunk_id)
-            if idx < len(cache["translated_parts"]):
-                partes_ordenadas.append(cache["translated_parts"][idx])
-            else:
-                log(f"Chunk {chunk_id} sin traducción en caché, usando original.", "WARN")
-                partes_ordenadas.append(chunks[i]["texto"])
-        else:
-            log(f"Chunk {chunk_id} no encontrado en caché, usando original.", "WARN")
-            partes_ordenadas.append(chunks[i]["texto"])
+    # Usar el dict resultados (ordenado por índice) para el ensamblado
+    partes_ordenadas = [
+        resultados.get(i, chunks[i]["texto"])   # fallback al original si faltara
+        for i in range(len(chunks))
+    ]
 
     # Unimos los chunks con saltos de párrafo en lugar de líneas divisorias ---
     md_completo = "\n\n".join(partes_ordenadas)

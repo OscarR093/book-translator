@@ -16,7 +16,7 @@ src: "English"
 dst: "Español"
 
 # paginas: Rango de páginas a traducir (ej: "1-50"). Dejar vacío o en null para traducir todo.
-paginas: 1-15
+paginas: null
 
 # chunk_tokens: Tamaño aproximado en tokens para cada trozo (chunk)
 chunk_tokens: 900
@@ -26,6 +26,10 @@ timeout: 120
 
 # retries: Reintentos en caso de error
 retries: 3
+
+# workers: Número de solicitudes paralelas al LLM (recomendado: 4-16 para vLLM).
+# Con workers > 1, el contexto entre chunks se desactiva automáticamente.
+workers: 12
 
 # output: Carpeta destino
 output: "output"

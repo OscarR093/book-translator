@@ -21,22 +21,49 @@ import textwrap
 import time
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 import requests
 import pymupdf4llm
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURACIÓN POR DEFECTO (se sobreescribe con argumentos CLI)
+# CONFIGURACIÓN POR DEFECTO (se sobreescribe con config.yaml y CLI)
 # ─────────────────────────────────────────────────────────────
 DEFAULTS = {
     "model":        "translategemma:12b",
-    "src_lang":     "English",
-    "dst_lang":     "Español",
-    "backend":      "ollama",            # "ollama" | "aphrodite"
-    "api_base":     "http://localhost:11434/api",
+    "src":          "English",
+    "dst":          "Español",
+    "backend":      "vllm",              # "ollama", "vllm" o "aphrodite"
+    "api_base":     "http://localhost:8000/v1",
     "chunk_tokens": 900,                 # aprox tokens por chunk de traducción
     "timeout":      120,                 # segundos por petición al LLM
     "retries":      3,                   # reintentos ante fallo de red
+    "paginas":      None,
+    "output":       "output",
+    "no_pdf":       False,
+    "limpio":       False,
 }
+
+# Intentar cargar config.yaml global
+config_path = Path("config.yaml")
+if config_path.exists():
+    if yaml is None:
+        print("[!] config.yaml encontrado pero 'PyYAML' no está instalado. Ejecuta: pip install PyYAML")
+    else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                _yml_cfg = yaml.safe_load(f) or {}
+                for _k, _v in _yml_cfg.items():
+                    # Homologar variantes o guiones medios
+                    _k_norm = _k.replace("-", "_")
+                    if _k_norm == "src_lang": _k_norm = "src"
+                    if _k_norm == "dst_lang": _k_norm = "dst"
+                    DEFAULTS[_k_norm] = _v
+        except Exception as _e:
+            print(f"[-] Advertencia: No se pudo leer config.yaml ({_e})")
 
 # ─────────────────────────────────────────────────────────────
 # PANDOC: plantilla LaTeX mínima para PDF elegante
@@ -69,6 +96,22 @@ def log(msg: str, level: str = "INFO"):
 def estimar_tokens(texto: str) -> int:
     """Estimación rápida: ~1 token cada 4 caracteres."""
     return len(texto) // 4
+
+
+def get_iso_code(lang: str) -> str:
+    """Mapea nombres comunes de idiomas a códigos ISO 2-letras."""
+    lang_map = {
+        "english": "en", "inglés": "en",
+        "spanish": "es", "español": "es", "castellano": "es",
+        "french": "fr", "francés": "fr",
+        "german": "de", "alemán": "de",
+        "portuguese": "pt", "portugués": "pt",
+        "italian": "it", "italiano": "it",
+        "chinese": "zh", "chino": "zh",
+        "japanese": "ja", "japonés": "ja",
+        "russian": "ru", "ruso": "ru",
+    }
+    return lang_map.get(lang.lower(), lang.lower()[:2])
 
 
 def rango_paginas(spec: str, total: int) -> list[int]:
@@ -116,17 +159,30 @@ def verificar_ollama(api_base: str, model: str):
     log("Ollama listo.", "OK")
 
 
-def verificar_aphrodite(api_base: str, model: str):
-    log("Verificando Aphrodite Engine (OpenAI-compatible)...")
+def verificar_openai_compatible(api_base: str, model: str, backend_name: str = "vLLM/Aphrodite"):
+    log(f"Verificando {backend_name} (OpenAI-compatible)...")
+    # Limpiar api_base: asegurar que no termine en /chat/completions o /completions
+    base_url = api_base.rstrip("/")
+    if base_url.endswith("/v1"):
+        models_url = f"{base_url}/models"
+    else:
+        models_url = f"{base_url}/v1/models" if "/v1" not in base_url else f"{base_url}/models"
+
     try:
-        r = requests.get(f"{api_base}/models", timeout=5)
+        r = requests.get(models_url, timeout=10)
         r.raise_for_status()
         modelos = [m["id"] for m in r.json().get("data", [])]
-        log(f"Modelos disponibles: {modelos}")
+        log(f"Modelos disponibles en {backend_name}: {modelos}")
+        if model not in modelos:
+             log(f"ERROR: El modelo '{model}' no está cargado en {backend_name}.", "ERR")
+             log(f"Modelos permitidos: {modelos}", "ERR")
+             log("Por favor, actualiza el campo 'model' en config.yaml", "ERR")
+             sys.exit(1)
     except Exception as e:
-        log(f"No se pudo conectar con Aphrodite en {api_base}: {e}", "ERR")
+        log(f"No se pudo conectar con {backend_name} en {models_url}: {e}", "ERR")
+        log("Asegúrate de que el servidor está corriendo y la URL es correcta.", "ERR")
         sys.exit(1)
-    log("Aphrodite lista.", "OK")
+    log(f"{backend_name} listo.", "OK")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -179,35 +235,59 @@ def extraer_markdown_por_pagina(pdf_path: str, paginas: list[int], images_dir: P
 # AGRUPACIÓN EN CHUNKS CON VENTANA DE CONTEXTO
 # ─────────────────────────────────────────────────────────────
 
+import re
+
 def agrupar_en_chunks(paginas_md: list[dict], max_tokens: int) -> list[dict]:
     """
-    Agrupa páginas en lotes de traducción respetando max_tokens.
+    Agrupa el texto en lotes semánticos (por párrafo) respetando max_tokens.
+    Reconstruye inteligentemente oraciones rotas por saltos de página.
     Cada chunk incluye metadatos de las páginas que abarca.
     """
-    chunks = []
-    buffer_texto = ""
-    buffer_paginas = []
-
+    bloques = []
+    
+    # 1. Descomponer todo en párrafos individuales, uniendo frases partidas entre páginas
     for pmd in paginas_md:
-        texto = pmd["markdown"]
+        texto = pmd["markdown"].strip()
         if not texto:
             continue
+            
+        parrafos = [p.strip() for p in texto.split("\n\n") if p.strip()]
+        if not parrafos:
+            continue
+            
+        # Si hay un bloque anterior y termina sin puntuación final, asumimos que un salto de página cortó la frase
+        if bloques and bloques[-1]["texto"] and bloques[-1]["texto"][-1] not in ".!?\":;)]>":
+            # Prevenir la fusión si el siguiente párrafo es un elemento de bloque de Markdown (título, lista, imagen)
+            is_block = re.match(r"^(#{1,6}\s|\* |\- |\d+\. |!\[|> )", parrafos[0])
+            if not is_block:
+                bloques[-1]["texto"] += " " + parrafos[0]
+                bloques[-1]["paginas"].add(pmd["page"])
+                parrafos = parrafos[1:] # Procesar el resto normalmente
+            
+        for p in parrafos:
+            bloques.append({"texto": p, "paginas": {pmd["page"]}})
 
+    # 2. Empaquetar los párrafos en chunks de traducción según max_tokens
+    chunks = []
+    buffer_texto = ""
+    buffer_paginas = set()
+
+    for b in bloques:
+        tokens_nuevos = estimar_tokens(b["texto"])
         tokens_actuales = estimar_tokens(buffer_texto)
-        tokens_nuevos   = estimar_tokens(texto)
-
+        
         if tokens_actuales + tokens_nuevos > max_tokens and buffer_texto:
-            chunks.append({"paginas": buffer_paginas[:], "texto": buffer_texto.strip()})
-            buffer_texto  = texto
-            buffer_paginas = [pmd["page"]]
+            chunks.append({"paginas": sorted(list(buffer_paginas)), "texto": buffer_texto.strip()})
+            buffer_texto = b["texto"]
+            buffer_paginas = set(b["paginas"])
         else:
-            buffer_texto  += "\n\n" + texto if buffer_texto else texto
-            buffer_paginas.append(pmd["page"])
+            buffer_texto += "\n\n" + b["texto"] if buffer_texto else b["texto"]
+            buffer_paginas.update(b["paginas"])
 
     if buffer_texto.strip():
-        chunks.append({"paginas": buffer_paginas, "texto": buffer_texto.strip()})
+        chunks.append({"paginas": sorted(list(buffer_paginas)), "texto": buffer_texto.strip()})
 
-    log(f"Texto dividido en {len(chunks)} chunks de traducción.", "OK")
+    log(f"Texto extraído re-ensamblado en {len(chunks)} chunks semánticos (por párrafo).", "OK")
     return chunks
 
 
@@ -229,8 +309,22 @@ SYSTEM_PROMPT = (
 )
 
 
-def construir_user_message(texto: str, src: str, dst: str, contexto: str) -> str:
-    """Mensaje del usuario: sólo contiene el texto a traducir y el contexto mínimo estructurado en XML."""
+def construir_user_message(texto: str, src: str, dst: str, contexto: str, model: str = "") -> str:
+    """
+    Mensaje del usuario: detecta si es TranslateGemma para usar el formato de marcas estricto.
+    """
+    is_translategemma = "translategemma" in model.lower()
+
+    if is_translategemma:
+        # Formato oficial: <<<source>>>{src}<<<target>>>{dst}<<<text>>>{text}
+        src_iso = get_iso_code(src)
+        dst_iso = get_iso_code(dst)
+        
+        # El contexto se inyecta al inicio del texto si existe
+        full_text = f"<context>\n{contexto}\n</context>\n\n{texto}" if contexto else texto
+        return f"<<<source>>>{src_iso}<<<target>>>{dst_iso}<<<text>>>{full_text}"
+
+    # Formato estándar para otros modelos
     partes = [f"Translate the text within <text> from {src} to {dst}."]
     if contexto:
         partes.append(f"<context>\n{contexto}\n</context>")
@@ -337,23 +431,58 @@ def traducir_ollama(texto: str, src: str, dst: str, contexto: str,
 
 def traducir_aphrodite(texto: str, src: str, dst: str, contexto: str,
                         api_base: str, model: str, timeout: int, retries: int) -> str:
-    """Aphrodite Engine usa la API compatible con OpenAI /v1/chat/completions."""
-    user_msg = construir_user_message(texto, src, dst, contexto)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 4096,
-    }
+    # Intentar detectar si el modelo requiere el endpoint legado /completions
+    # (vLLM suele preferir /v1/chat/completions para modelos -it)
+    # Si el usuario quiere forzar completions, puede incluirlo en el modelo o backend, 
+    # pero aquí intentaremos ser inteligentes.
+    
+    # FORZAR chat/completions por defecto para vLLM/Aphrodite models modernos
+    endpoint = "/chat/completions"
+    
+    # Formato estándar para el 99% de los modelos (Chat API)
+    user_msg = construir_user_message(texto, src, dst, contexto, model=model)
+    
+    # Si es TranslateGemma, NO incluimos SYSTEM_PROMPT porque el modelo es zero-shot 
+    # y vLLM puede rechazar mensajes que no empiecen con <<<source>>> si el template es estricto.
+    is_translategemma = "translategemma" in model.lower()
+    
+    if is_translategemma:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096,
+        }
+    else:
+        combined_msg = f"{SYSTEM_PROMPT}\n\n{user_msg}"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": combined_msg},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096,
+        }
 
     for intento in range(1, retries + 1):
         try:
-            r = requests.post(f"{api_base}/chat/completions", json=payload, timeout=timeout)
+            r = requests.post(f"{api_base}{endpoint}", json=payload, timeout=timeout)
             r.raise_for_status()
-            traduccion = r.json()["choices"][0]["message"]["content"].strip()
+            
+            resp_json = r.json()
+            if "choices" in resp_json and len(resp_json["choices"]) > 0:
+                choice = resp_json["choices"][0]
+                if "message" in choice:
+                    traduccion = choice["message"]["content"].strip()
+                elif "text" in choice:
+                    traduccion = choice["text"].strip()
+                else:
+                    traduccion = ""
+            else:
+                traduccion = ""
+                
             return limpiar_traduccion(traduccion)
         except Exception as e:
             log(f"Intento {intento}/{retries} fallido: {e}", "WARN")
@@ -365,7 +494,7 @@ def traducir_aphrodite(texto: str, src: str, dst: str, contexto: str,
 
 
 def traducir_chunk(chunk_texto: str, src: str, dst: str, contexto: str, cfg: dict) -> str:
-    if cfg["backend"] == "aphrodite":
+    if cfg["backend"] in ["aphrodite", "vllm"]:
         return traducir_aphrodite(
             chunk_texto, src, dst, contexto,
             cfg["api_base"], cfg["model"], cfg["timeout"], cfg["retries"],
@@ -463,17 +592,17 @@ def main():
 
     parser.add_argument("archivo",          help="Ruta al archivo PDF")
     parser.add_argument("--model",          default=DEFAULTS["model"],        help="Modelo LLM")
-    parser.add_argument("--src",            default=DEFAULTS["src_lang"],     help="Idioma origen")
-    parser.add_argument("--dst",            default=DEFAULTS["dst_lang"],     help="Idioma destino")
-    parser.add_argument("--backend",        default=DEFAULTS["backend"],      choices=["ollama", "aphrodite"])
+    parser.add_argument("--src",            default=DEFAULTS["src"],          help="Idioma origen")
+    parser.add_argument("--dst",            default=DEFAULTS["dst"],          help="Idioma destino")
+    parser.add_argument("--backend",        default=DEFAULTS["backend"],      choices=["ollama", "aphrodite", "vllm"])
     parser.add_argument("--api-base",       default=DEFAULTS["api_base"],     help="URL base de la API del LLM")
     parser.add_argument("--chunk-tokens",   default=DEFAULTS["chunk_tokens"], type=int)
     parser.add_argument("--timeout",        default=DEFAULTS["timeout"],      type=int)
     parser.add_argument("--retries",        default=DEFAULTS["retries"],      type=int)
-    parser.add_argument("--paginas",        default=None,  help="Rango de páginas ej: 1-50,80-100")
-    parser.add_argument("--output",         default="output", help="Carpeta de salida")
-    parser.add_argument("--no-pdf",         action="store_true", help="Sólo generar .md, no PDF")
-    parser.add_argument("--limpio",         action="store_true", help="Ignorar caché y empezar de cero")
+    parser.add_argument("--paginas",        default=DEFAULTS["paginas"],      help="Rango de páginas ej: 1-50,80-100")
+    parser.add_argument("--output",         default=DEFAULTS["output"],       help="Carpeta de salida")
+    parser.add_argument("--no-pdf",         action="store_true", default=DEFAULTS["no_pdf"], help="Sólo generar .md, no PDF")
+    parser.add_argument("--limpio",         action="store_true", default=DEFAULTS["limpio"], help="Ignorar caché y empezar de cero")
 
     args = parser.parse_args()
 
@@ -521,7 +650,15 @@ def main():
     if args.backend == "ollama":
         verificar_ollama(args.api_base, args.model)
     else:
-        verificar_aphrodite(args.api_base, args.model)
+        # Normalizar api_base para OpenAI-compatible (vLLM/Aphrodite)
+        # Si termina en /chat/completions o /completions, quitarlo
+        base = args.api_base.rstrip("/")
+        for suffix in ["/chat/completions", "/completions"]:
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+        cfg["api_base"] = base.rstrip("/")
+        
+        verificar_openai_compatible(cfg["api_base"], args.model, args.backend.upper())
 
     # ── Determinar páginas a procesar ──────────────────────
     import fitz
@@ -582,7 +719,18 @@ def main():
 
     # ── Ensamblar Markdown final ───────────────────────────
     log("Ensamblando Markdown traducido...")
-    md_completo = "\n\n---\n\n".join(cache["translated_parts"])
+    
+    # Unimos los chunks con saltos de párrafo en lugar de líneas divisorias ---
+    # Si un párrafo quedó cortado a la mitad por el tamaño del chunk, será más fluido.
+    md_completo = "\n\n".join(cache["translated_parts"])
+    
+    import re
+    # Asegurar que los encabezados Markdown tengan una línea en blanco antes y después.
+    # Romper los que se hayan colado en la misma línea por errores del LLM
+    md_completo = re.sub(r"([^\n])\s+(#{1,6}\s+\*\*?[A-ZÍÓÚÁÉa-z0-9])", r"\1\n\n\2", md_completo)
+    # Rellenar con línea en blanco los que solo tienen 1 salto de línea
+    md_completo = re.sub(r"([^\n])\n(#{1,6}\s)", r"\1\n\n\2", md_completo)
+    
     md_out.write_text(md_completo, encoding="utf-8")
     log(f"Markdown guardado: {md_out}", "OK")
 

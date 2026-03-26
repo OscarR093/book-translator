@@ -1,0 +1,37 @@
+# config.yaml (Configuraciones para el Traductor de PDF)
+
+# backend: "ollama", "vllm" o "aphrodite"
+backend: "vllm"
+
+# api_base: La URL base de la API (ej: http://localhost:11434/api para Ollama o http://localhost:8000/v1 para vLLM)
+api_base: "http://localhost:8000/v1"
+
+# model: El nombre del modelo a utilizar (debe coincidir exactamente con el de vLLM)
+model: "google/translategemma-4b-it"
+
+# src: Idioma de origen
+src: "English"
+
+# dst: Idioma de destino 
+dst: "Español"
+
+# paginas: Rango de páginas a traducir (ej: "1-50"). Dejar vacío o en null para traducir todo.
+paginas: 1-15
+
+# chunk_tokens: Tamaño aproximado en tokens para cada trozo (chunk)
+chunk_tokens: 900
+
+# timeout: Segundos a esperar antes de agotar el tiempo por petición
+timeout: 120
+
+# retries: Reintentos en caso de error
+retries: 3
+
+# output: Carpeta destino
+output: "output"
+
+# no_pdf: Si está en true, no genera el PDF y solo deja el md
+no_pdf: false
+
+# limpio: Si está en true, ignora la caché
+limpio: false

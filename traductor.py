@@ -317,12 +317,12 @@ def construir_user_message(texto: str, src: str, dst: str, contexto: str, model:
 
     if is_translategemma:
         # Formato oficial: <<<source>>>{src}<<<target>>>{dst}<<<text>>>{text}
+        # IMPORTANTE: NO inyectar contexto dentro de <<<text>>> ya que confunde al modelo.
+        # El contexto se coloca ANTES del marcador como un comentario informal,
+        # pero el bloque <<<text>>> contiene SOLO el texto a traducir.
         src_iso = get_iso_code(src)
         dst_iso = get_iso_code(dst)
-        
-        # El contexto se inyecta al inicio del texto si existe
-        full_text = f"<context>\n{contexto}\n</context>\n\n{texto}" if contexto else texto
-        return f"<<<source>>>{src_iso}<<<target>>>{dst_iso}<<<text>>>{full_text}"
+        return f"<<<source>>>{src_iso}<<<target>>>{dst_iso}<<<text>>>{texto}"
 
     # Formato estándar para otros modelos
     partes = [f"Translate the text within <text> from {src} to {dst}."]
@@ -350,6 +350,15 @@ def limpiar_traduccion(texto: str) -> str:
     Elimina artefactos del prompt aislando el contenido a través de parseo XML rudimentario
     o limpieza línea a línea por si el modelo falla.
     """
+    # 0. Eliminar marcadores de TranslateGemma si el modelo los repite en su respuesta
+    # Patrón: <<<source>>>xx<<<target>>>yy<<<text>>>  (el texto traducido viene después)
+    tg_match = re.search(
+        r"<<<source>>>[a-z]{2}<<<target>>>[a-z]{2}<<<text>>>(.*)",
+        texto, flags=re.DOTALL | re.IGNORECASE,
+    )
+    if tg_match:
+        texto = tg_match.group(1).strip()
+
     # 1. Si el modelo escupió el contexto rodeado de <context>...</context>, eliminarlo por completo
     texto = re.sub(r"<context>.*?</context>", "", texto, flags=re.DOTALL | re.IGNORECASE)
     texto = texto.strip()
@@ -358,7 +367,7 @@ def limpiar_traduccion(texto: str) -> str:
     match = re.search(r"<text>\s*(.*?)\s*</text>", texto, flags=re.DOTALL | re.IGNORECASE)
     if match:
         texto = match.group(1).strip()
-    
+
     # 3. Remover etiquetas huérfanas
     texto = re.sub(r"</?text>", "", texto, flags=re.IGNORECASE)
     texto = re.sub(r"</?context>", "", texto, flags=re.IGNORECASE)
@@ -419,14 +428,17 @@ def traducir_ollama(texto: str, src: str, dst: str, contexto: str,
             r = requests.post(f"{api_base}/chat", json=payload, timeout=timeout)
             r.raise_for_status()
             traduccion = r.json().get("message", {}).get("content", "").strip()
-            return limpiar_traduccion(traduccion)
+            traduccion_limpia = limpiar_traduccion(traduccion)
+            if traduccion_limpia:
+                return traduccion_limpia
+            log(f"Intento {intento}/{retries}: respuesta vacía tras limpieza, reintentando...", "WARN")
         except Exception as e:
             log(f"Intento {intento}/{retries} fallido: {e}", "WARN")
             if intento < retries:
                 time.sleep(3 * intento)
 
-    log("Todos los intentos fallaron. Devolviendo texto original.", "ERR")
-    return texto  # fallback: preservar original
+    log("Todos los intentos fallaron. Devolviendo texto original sin traducir.", "ERR")
+    return ""  # El caller decide el fallback
 
 
 def traducir_aphrodite(texto: str, src: str, dst: str, contexto: str,
@@ -483,14 +495,18 @@ def traducir_aphrodite(texto: str, src: str, dst: str, contexto: str,
             else:
                 traduccion = ""
                 
-            return limpiar_traduccion(traduccion)
+            traduccion_limpia = limpiar_traduccion(traduccion)
+            if traduccion_limpia:
+                return traduccion_limpia
+            # Si la limpieza dejó vacío, reintentar
+            log(f"Intento {intento}/{retries}: respuesta vacía tras limpieza, reintentando...", "WARN")
         except Exception as e:
             log(f"Intento {intento}/{retries} fallido: {e}", "WARN")
             if intento < retries:
                 time.sleep(3 * intento)
 
-    log("Todos los intentos fallaron. Devolviendo texto original.", "ERR")
-    return texto
+    log("Todos los intentos fallaron. Devolviendo texto original sin traducir.", "ERR")
+    return ""  # Devolver vacío para que el caller decida qué hacer
 
 
 def traducir_chunk(chunk_texto: str, src: str, dst: str, contexto: str, cfg: dict) -> str:
@@ -685,7 +701,15 @@ def main():
     # ── Traducción chunk a chunk ───────────────────────────
     print()
     log(f"Iniciando traducción: {len(chunks)} chunks...")
+
+    # Reconstruir contexto_previo a partir de los chunks ya en caché (en orden)
+    # Esto garantiza que el primer chunk nuevo reciba contexto correcto al reanudar.
     contexto_previo = ""
+    for _cid in cache["chunks_done"]:
+        _idx = cache["chunks_done"].index(_cid)
+        _part = cache["translated_parts"][_idx] if _idx < len(cache["translated_parts"]) else ""
+        if _part:
+            contexto_previo = _part[-300:]
 
     for i, chunk in enumerate(chunks):
         chunk_id = f"chunk_{i:04d}"
@@ -693,9 +717,6 @@ def main():
 
         if chunk_id in cache["chunks_done"]:
             log(f"  [{i+1}/{len(chunks)}] páginas {paginas_str} — ya traducido (skip)")
-            # Recuperar el texto traducido para mantener el contexto
-            idx = cache["chunks_done"].index(chunk_id)
-            contexto_previo = cache["translated_parts"][idx][-300:]
             continue
 
         log(f"  [{i+1}/{len(chunks)}] Traduciendo páginas {paginas_str} "
@@ -709,8 +730,13 @@ def main():
             cfg,
         )
 
+        if not traduccion:
+            # Si el LLM falló completamente, usar el texto original y registrar el error
+            log(f"  [{i+1}/{len(chunks)}] ADVERTENCIA: traducción fallida, se conserva texto original.", "ERR")
+            traduccion = chunk["texto"]
+
         # Actualizar contexto con el final del chunk traducido (últimos 300 chars)
-        contexto_previo = traduccion[-300:] if traduccion else ""
+        contexto_previo = traduccion[-300:]
 
         # Guardar en caché
         cache["chunks_done"].append(chunk_id)
@@ -719,18 +745,32 @@ def main():
 
     # ── Ensamblar Markdown final ───────────────────────────
     log("Ensamblando Markdown traducido...")
-    
+
+    # Construir el Markdown en el orden correcto de los chunks (no del caché)
+    # Esto evita problemas cuando la caché tiene partes en desorden o incompleta.
+    partes_ordenadas = []
+    for i in range(len(chunks)):
+        chunk_id = f"chunk_{i:04d}"
+        if chunk_id in cache["chunks_done"]:
+            idx = cache["chunks_done"].index(chunk_id)
+            if idx < len(cache["translated_parts"]):
+                partes_ordenadas.append(cache["translated_parts"][idx])
+            else:
+                log(f"Chunk {chunk_id} sin traducción en caché, usando original.", "WARN")
+                partes_ordenadas.append(chunks[i]["texto"])
+        else:
+            log(f"Chunk {chunk_id} no encontrado en caché, usando original.", "WARN")
+            partes_ordenadas.append(chunks[i]["texto"])
+
     # Unimos los chunks con saltos de párrafo en lugar de líneas divisorias ---
-    # Si un párrafo quedó cortado a la mitad por el tamaño del chunk, será más fluido.
-    md_completo = "\n\n".join(cache["translated_parts"])
-    
+    md_completo = "\n\n".join(partes_ordenadas)
+
     import re
     # Asegurar que los encabezados Markdown tengan una línea en blanco antes y después.
-    # Romper los que se hayan colado en la misma línea por errores del LLM
     md_completo = re.sub(r"([^\n])\s+(#{1,6}\s+\*\*?[A-ZÍÓÚÁÉa-z0-9])", r"\1\n\n\2", md_completo)
     # Rellenar con línea en blanco los que solo tienen 1 salto de línea
     md_completo = re.sub(r"([^\n])\n(#{1,6}\s)", r"\1\n\n\2", md_completo)
-    
+
     md_out.write_text(md_completo, encoding="utf-8")
     log(f"Markdown guardado: {md_out}", "OK")
 

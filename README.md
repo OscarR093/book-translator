@@ -1,67 +1,160 @@
-# Traductor de PDF Local con IA (Ollama)
+# 📚 PDF Translator — Traducción local con LLM
 
-Un script en Python diseñado para traducir documentos PDF completos de forma local, página por página, manteniendo el diseño original y utilizando modelos de lenguaje (LLMs) ejecutados en tu propia máquina a través de [Ollama](https://ollama.com).
+Traduce documentos PDF completos de forma local usando modelos de lenguaje (LLMs) ejecutados en tu propia máquina. Soporta **Ollama**, **vLLM** y **Aphrodite Engine** como backends.
 
-## 🚀 Características
-- **Traducción 100% Local y Privada**: Sin APIs de pago ni envío de datos a terceros. Funciona completamente off-line gracias a Ollama.
-- **Gestión Automática del Modelo**: Detecta si Ollama está en ejecución, descarga modelos innecesarios de la memoria VRAM y precarga el modelo objetivo (por defecto `translategemma:12b`).
-- **Resiliencia y Reanudación**: Divide el PDF y procesa página por página guardando temporales. Si el proceso se interrumpe, continuará exactamente donde se quedó.
-- **Contexto Persistente**: La IA recuerda el último párrafo traducido para proporcionar contexto a la siguiente oración, evitando perder concordancia en textos divididos.
-- **Formateo Inteligente**: Detecta títulos y texto regular. Usa fuentes y tamaños estandarizados (Centrado/16pt para títulos con negritas, Justificado/11pt para el resto), y reajusta automáticamente el tamaño si la traducción es demasiado larga para la caja.
-- **Limpieza Automática**: Combina todas las páginas en el nuevo PDF final y elimina los temporales de manera automática.
+**Pipeline:**
+```
+PDF → pymupdf4llm → Markdown por páginas → chunks semánticos
+    → LLM (Ollama / vLLM / Aphrodite) → Markdown traducido → Pandoc → PDF
+```
+
+---
+
+## ✨ Características
+
+- **100% Local y Privado** — Sin APIs de pago ni datos enviados a terceros.
+- **Multi-backend** — Ollama (CPU/GPU), vLLM (GPU, OpenAI-compatible), Aphrodite Engine.
+- **Traducción Paralela** — Solicitudes concurrentes configurables (`workers`), aprovechando el batching de vLLM.
+- **Reanudación automática** — Caché de progreso en JSON: si se interrumpe, continúa donde se quedó.
+- **Contexto semántico** — En modo secuencial, el traductor recuerda los últimos párrafos para mantener coherencia.
+- **Preserva formato Markdown** — Títulos, negritas, cursivas, listas e imágenes se mantienen intactos.
+- **Generación de PDF** — Pandoc + XeLaTeX convierte el Markdown traducido en un PDF tipográfico final.
+- **Configuración centralizada** — Todos los parámetros en `config.yaml`; sin tocar el código.
+
+---
 
 ## 🛠️ Requisitos Previos
 
-1. **Ollama**: Debes tener instalado Ollama y haber descargado el modelo que usarás.
+1. **Python 3.11+** (entorno conda recomendado)
+2. **Pandoc** y **XeLaTeX** para la generación del PDF final:
    ```bash
-   ollama run translategemma:12b
+   sudo apt install pandoc texlive-xetex texlive-fonts-recommended
    ```
-2. **Python 3.10+**: O un gestor de entornos como Conda.
+3. Al menos un backend LLM activo (ver sección [Backends](#-backends)).
+
+---
 
 ## 📦 Instalación
 
-1. Clona este repositorio o descarga los archivos.
-2. Es sumamente recomendable crear un entorno virtual para las dependencias (usando `venv` o `conda`):
-   ```bash
-   conda create -n pdf-translator python=3.11 -y
-   conda activate pdf-translator
-   ```
-3. Instala los requerimientos a través de pip:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *Dependencias Principales: `PyMuPDF` (para el procesado PDF) y `requests` (para la API de Ollama).*
+```bash
+# 1. Crear entorno conda
+conda create -n pdf-translator python=3.11 -y
+conda activate pdf-translator
 
-## ⚙️ Configuración (Opcional)
-
-Si deseas traducir a un idioma distinto o utilizar otro modelo, puedes editar las variables globales al inicio de `traductor.py`:
-
-```python
-MODELO_OLLAMA = "translategemma:12b"
-IDIOMA_ORIGEN = "English"
-CODIGO_ORIGEN = "EN"
-IDIOMA_DESTINO = "Español"
-CODIGO_DESTINO = "ES"
-FUENTE_NORMAL = "tiro"      # Times-Roman
-FUENTE_NEGRITA = "TiBo"     # Times-Bold
+# 2. Instalar dependencias
+pip install -r requirements.txt
 ```
+
+**Dependencias principales:** `pymupdf4llm`, `requests`, `PyYAML`, `PyMuPDF`
+
+---
+
+## ⚙️ Configuración
+
+Edita `config.yaml` para ajustar el comportamiento sin tocar el código:
+
+```yaml
+backend: "vllm"                        # "ollama" | "vllm" | "aphrodite"
+api_base: "http://localhost:8000/v1"   # URL base del servidor LLM
+model: "google/translategemma-4b-it"   # Nombre exacto del modelo
+
+src: "English"      # Idioma origen
+dst: "Español"      # Idioma destino
+
+paginas: null        # null = todo el PDF, o "1-50,80-100"
+chunk_tokens: 900    # Tokens por chunk de traducción
+timeout: 120         # Segundos por petición al LLM
+retries: 3           # Reintentos ante fallo de red
+workers: 8           # Solicitudes paralelas (>1 desactiva contexto entre chunks)
+
+output: "output"     # Carpeta de salida
+no_pdf: false        # true = solo genera .md, no PDF
+limpio: false        # true = ignora la caché y empieza de cero
+```
+
+---
 
 ## 🎮 Uso
 
-Asegúrate de que Ollama se esté ejecutando en segundo plano en tu equipo (`ollama serve`).
-
-Luego, simplemente pasa la ruta de tu PDF como argumento al script:
-
 ```bash
-python traductor.py mi_documento.pdf
+# Traducir todo el PDF (configuración desde config.yaml)
+python traductor.py mi_libro.pdf
+
+# Sobrescribir parámetros puntualmente desde CLI
+python traductor.py mi_libro.pdf --paginas 1-50 --workers 4
+python traductor.py mi_libro.pdf --backend ollama --api-base http://localhost:11434/api
+python traductor.py mi_libro.pdf --limpio   # re-traducir desde cero ignorando caché
+python traductor.py mi_libro.pdf --no-pdf   # solo genera el .md, sin PDF
 ```
 
 ### 📂 Estructura de Salida
-El script creará automáticamente una carpeta llamada `output` en el directorio de trabajo:
-- `output/mi_documento/temp/`: Almacena las páginas divididas para evitar procesar toda la memoria RAM a la vez. (Se borra al finalizar).
-- `output/mi_documento/mi_documento_traducido.pdf`: El archivo final y unificado.
 
-## ⚠️ Limitaciones Conocidas
+```
+output/
+└── mi_libro/
+    ├── images/                    # Imágenes extraídas del PDF
+    ├── mi_libro_traducido.md      # Markdown traducido (intermedio)
+    ├── mi_libro_traducido.pdf     # PDF final con tipografía
+    └── mi_libro_progreso.json     # Caché de progreso (se borra al terminar)
+```
 
-- **Bleeding de Negritas**: En algunos libros o PDFs mal formateados (especialmente escaneos pasados por OCR), los metadatos de las fuentes del título no se cierran de forma limpia. El script cuenta con validadores para ignorar falsos positivos, pero en casos extremos todo un bloque podría renderizarse en negritas.
-- **PDFs basados en Imágenes**: El script extrae el código del texto. Si tu PDF está compuesto literalmente de fotografías de páginas escaneadas sin una capa de OCR integrada, el script no encontrará texto que extraer.
+---
+
+## 🔌 Backends
+
+### Ollama (CPU/GPU, fácil de usar)
+
+```bash
+# Instalar y arrancar
+ollama serve
+ollama pull translategemma:12b
+
+# config.yaml
+backend: "ollama"
+api_base: "http://localhost:11434/api"
+model: "translategemma:12b"
+workers: 1   # Ollama no tiene batching nativo; usar 1
+```
+
+### vLLM (GPU, recomendado para velocidad)
+
+```bash
+# Arrancar servidor vLLM
+vllm serve google/translategemma-4b-it --port 8000
+
+# config.yaml
+backend: "vllm"
+api_base: "http://localhost:8000/v1"
+model: "google/translategemma-4b-it"
+workers: 8   # vLLM maneja múltiples peticiones en paralelo
+```
+
+> Ver la [Guía de Migración Ollama → vLLM](MIGRATION_OLLAMA_TO_VLLM.md) para instrucciones detalladas.
+
+### Aphrodite Engine (alternativa a vLLM)
+
+```bash
+# config.yaml
+backend: "aphrodite"
+api_base: "http://localhost:2242/v1"
+model: "nombre-del-modelo"
+```
+
+---
+
+## 🤖 Modelos Recomendados
+
+| Modelo | Backend | VRAM | Calidad |
+|--------|---------|------|---------|
+| `google/translategemma-4b-it` | vLLM | ~8 GB | ⭐⭐⭐⭐⭐ (especializado en traducción) |
+| `translategemma:12b` | Ollama | ~16 GB | ⭐⭐⭐⭐⭐ |
+| `gemma3:12b` | Ollama | ~16 GB | ⭐⭐⭐⭐ |
+| `llama3.1:8b` | Ollama/vLLM | ~10 GB | ⭐⭐⭐ |
+
+---
+
+## ⚠️ Notas Importantes
+
+- **PDFs basados en imágenes**: Si el PDF no tiene texto seleccionable (solo imágenes escaneadas), primero debes aplicar OCR con Tesseract u otra herramienta para generar un PDF con texto embebido.
+- **Tesseract**: `pymupdf4llm` puede intentar usar Tesseract internamente para análisis de layout. Si el PDF ya tiene texto (como los `_final_ocr.pdf`), esto no es necesario y se desactiva automáticamente con `use_ocr=False` en el código.
+- **workers > 1**: En modo paralelo, el contexto entre chunks se desactiva porque el orden de ejecución de los threads no está garantizado. Para traducciones donde la coherencia entre párrafos es crítica, usa `workers: 1`.
